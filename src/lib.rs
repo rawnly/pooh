@@ -236,6 +236,14 @@ pub struct InitArgs {
     /// Target shell
     #[usage(choices("bash", "zsh", "fish"))]
     pub shell: String,
+
+    /// Also define a short alias for pooh (with completions), e.g. --alias p
+    #[usage(long)]
+    pub alias: Option<String>,
+
+    /// Name of the pick-and-cd function
+    #[usage(long, default = "pj")]
+    pub function: String,
 }
 
 #[derive(Debug, usage::Args)]
@@ -276,7 +284,8 @@ pub struct CompletionsArgs {
 #[derive(Debug, usage::Args)]
 pub struct SpecArgs {}
 
-fn main() -> ExitCode {
+/// Entry point shared by the `pooh` and `po` binaries.
+pub fn main() -> ExitCode {
     // Handles --help / --version / usage errors itself.
     let args = Args::parse();
     let json = args.json;

@@ -229,3 +229,12 @@ fn skill_installs_and_spec_prints() {
     assert!(e.pooh(e.root.path(), &["spec"]).1.contains("bin pooh"));
     assert!(e.pooh(e.root.path(), &["init", "zsh"]).1.contains("pj()"));
 }
+
+#[test]
+fn short_binary_is_the_same_program() {
+    let out = Command::new(env!("CARGO_BIN_EXE_po"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(out.stdout).unwrap().contains("0.1.0"));
+}

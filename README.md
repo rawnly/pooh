@@ -1,5 +1,7 @@
 # pooh
 
+Installs two binaries: `pooh` and the short `po` (same program).
+
 Project manager for the terminal. Register projects once, then jump to them (or to their git worktrees) from your shell, tmux, herdr or rex. Built on [usage-rs](https://usage.jdx.dev): completions, man page and a machine-readable spec come from the binary itself.
 
 Every command accepts `--json`. On failure it prints `{"error": "..."}` and exits 2; exit 1 means cancelled or no match.
@@ -39,7 +41,8 @@ Adding a linked worktree with `pooh add` registers its main repository. Bare rep
 ### Shell
 
 ```sh
-eval "$(pooh init zsh)"         # defines `pj [query]`: pick and cd (bash, zsh, fish)
+eval "$(pooh init zsh)"         # defines `pj [query]`: pick and cd, and completions for `po` (bash, zsh, fish)
+eval "$(pooh init zsh --alias p)" # ...plus an extra `alias p=pooh` with completions (--function NAME renames `pj`)
 pooh completions zsh            # also bash, fish, elvish, nu, powershell
 pooh spec | usage generate manpage -f - -o pooh.1
 ```

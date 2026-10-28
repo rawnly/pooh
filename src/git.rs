@@ -76,6 +76,20 @@ pub struct Worktree {
     pub main: bool,
 }
 
+/// Cheap check, no process spawned: git keeps one `worktrees/<name>` dir per
+/// linked worktree. Conservative: `true` whenever the layout is unfamiliar.
+pub fn may_have_linked_worktrees(repo: &Path, bare: bool) -> bool {
+    let common = if bare {
+        repo.to_path_buf()
+    } else {
+        repo.join(".git")
+    };
+    if !common.is_dir() {
+        return !bare; // `.git` file or missing: let git decide
+    }
+    std::fs::read_dir(common.join("worktrees")).is_ok_and(|mut d| d.next().is_some())
+}
+
 pub fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&git(
         repo,

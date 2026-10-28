@@ -365,46 +365,99 @@ fn worktree(json: bool, a: WorktreeArgs) -> Result<u8> {
     Ok(0)
 }
 
+/// Why `import` passed over a zoxide entry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Skip {
+    Registered,
+    Missing,
+    LowScore,
+    NotGit,
+    Subdirectory,
+    LinkedWorktree,
+}
+
+impl Skip {
+    fn key(self) -> &'static str {
+        match self {
+            Skip::Registered => "already_registered",
+            Skip::Missing => "missing",
+            Skip::LowScore => "below_min_score",
+            Skip::NotGit => "not_git",
+            Skip::Subdirectory => "inside_a_repository",
+            Skip::LinkedWorktree => "linked_worktree",
+        }
+    }
+}
+
+fn skip_reason(
+    path: &Path,
+    score: f64,
+    known: &std::collections::HashSet<PathBuf>,
+    a: &ImportArgs,
+) -> Option<Skip> {
+    if known.contains(path) {
+        return Some(Skip::Registered);
+    }
+    if !path.is_dir() {
+        return Some(Skip::Missing);
+    }
+    if a.min_score.is_some_and(|min| score < min) {
+        return Some(Skip::LowScore);
+    }
+    match git::inspect(path) {
+        // Linked worktrees belong to a repository we already list (or will).
+        Some(info) if info.linked => Some(Skip::LinkedWorktree),
+        Some(info) if !info.bare && info.root() != path => Some(Skip::Subdirectory),
+        Some(_) => None,
+        None => (!a.all).then_some(Skip::NotGit),
+    }
+}
+
 fn import(json: bool, a: ImportArgs) -> Result<u8> {
     // `source` is restricted to "zoxide" by the spec.
     let mut store = Store::load()?;
     let known: std::collections::HashSet<PathBuf> =
         store.projects.iter().map(|p| p.path.clone()).collect();
-    let (mut added, mut skipped) = (Vec::new(), 0usize);
+    let mut added = Vec::new();
+    let mut skipped: std::collections::BTreeMap<Skip, usize> = Default::default();
     for (score, path) in zoxide::list() {
-        let low = a.min_score.is_some_and(|min| score < min);
-        let usable = path.is_dir() && !known.contains(&path) && !low;
-        let candidate = usable
-            .then(|| match git::inspect(&path) {
-                // Subdirectories and linked worktrees belong to a repository we already list.
-                Some(info) if info.linked || info.root() != path && !info.bare => None,
-                Some(_) => Some(true),
-                None => a.all.then_some(false),
-            })
-            .flatten();
-        let Some(_) = candidate else {
-            skipped += 1;
+        if let Some(reason) = skip_reason(&path, score, &known, &a) {
+            *skipped.entry(reason).or_default() += 1;
             continue;
-        };
+        }
         let project = project_for(&path, None, vec!["zoxide".into()])?;
         if store.add(project.clone()).is_ok() {
             added.push(project);
         } else {
-            skipped += 1;
+            // Two zoxide paths can normalize to the same project name.
+            *skipped.entry(Skip::Registered).or_default() += 1;
         }
     }
     if !a.dry_run {
         store.save()?;
     }
+    let total: usize = skipped.values().sum();
     if json {
         let items: Vec<Value> = added.iter().map(|p| project_json(p, None)).collect();
-        print_json(&json!({ "dry_run": a.dry_run, "added": items, "skipped": skipped }))?;
+        let reasons: serde_json::Map<String, Value> = skipped
+            .iter()
+            .map(|(k, n)| (k.key().to_owned(), json!(n)))
+            .collect();
+        print_json(&json!({
+            "dry_run": a.dry_run,
+            "added": items,
+            "skipped": total,
+            "skipped_by_reason": reasons,
+        }))?;
     } else {
         let verb = if a.dry_run { "would add" } else { "added" };
         for p in &added {
             println!("{verb} {}", project_line(p));
         }
-        println!("{} {verb}, {skipped} skipped", added.len());
+        println!("{} {verb}, {total} skipped", added.len());
+        for (reason, n) in &skipped {
+            println!("  {n:>4}  {}", reason.key());
+        }
     }
     Ok(0)
 }
@@ -433,15 +486,39 @@ fn prune(json: bool, a: PruneArgs) -> Result<u8> {
 }
 
 fn init(a: InitArgs) -> Result<u8> {
-    let code = match a.shell.as_str() {
-        "fish" => {
-            "function pj\n    set -l dir (command pooh pick $argv)\n    and test -n \"$dir\"\n    and cd $dir\nend"
-        }
-        _ => {
-            "pj() {\n  local dir\n  dir=$(command pooh pick \"$@\") || return\n  [ -n \"$dir\" ] && cd \"$dir\"\n}"
-        }
+    let valid = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
     };
-    println!("{code}");
+    for name in a.alias.iter().chain([&a.function]) {
+        if !valid(name) {
+            bail!("'{name}' is not a valid shell command name");
+        }
+    }
+    let f = &a.function;
+    let mut out = match a.shell.as_str() {
+        "fish" => format!(
+            "function {f}\n    set -l dir (command pooh pick $argv)\n    and test -n \"$dir\"\n    and cd $dir\nend"
+        ),
+        _ => format!(
+            "{f}() {{\n  local dir\n  dir=$(command pooh pick \"$@\") || return\n  [ -n \"$dir\" ] && cd \"$dir\"\n}}"
+        ),
+    };
+    // `po` is the short binary: complete it like `pooh`.
+    out.push_str(match a.shell.as_str() {
+        "fish" => "\ncomplete -c po -w pooh",
+        "zsh" => "\n(( $+functions[compdef] )) && compdef po=pooh",
+        _ => "\ncomplete -p pooh >/dev/null 2>&1 && eval \"$(complete -p pooh | sed 's/ pooh$/ po/')\"",
+    });
+    if let Some(alias) = &a.alias {
+        out.push_str(&match a.shell.as_str() {
+            "fish" => format!("\nalias {alias} pooh\ncomplete -c {alias} -w pooh"),
+            "zsh" => format!("\nalias {alias}=pooh\n(( $+functions[compdef] )) && compdef {alias}=pooh"),
+            _ => format!("\nalias {alias}=pooh\ncomplete -p pooh >/dev/null 2>&1 && eval \"$(complete -p pooh | sed 's/ pooh$/ {alias}/')\""),
+        });
+    }
+    println!("{out}");
     Ok(0)
 }
 

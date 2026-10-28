@@ -54,11 +54,12 @@ pub fn build(store: &Store, filter: &Filter) -> Vec<Entry> {
         }
         let base = p.frecency(now);
         let rank = |path: &PathBuf| base + zoxide.get(path).copied().unwrap_or(0.0);
-        let worktrees = if filter.worktrees && p.exists() {
-            git::list_worktrees(&p.path).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let worktrees =
+            if filter.worktrees && p.exists() && git::may_have_linked_worktrees(&p.path, p.bare) {
+                git::list_worktrees(&p.path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
         // A bare repo has no checkout of its own to jump to.
         if !p.bare || worktrees.is_empty() {

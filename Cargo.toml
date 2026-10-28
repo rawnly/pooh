@@ -5,6 +5,15 @@ edition = "2024"
 description = "Project manager with git worktree and zoxide support, built for humans and agents"
 license = "MIT"
 
+[[bin]]
+name = "pooh"
+path = "src/bin/pooh.rs"
+
+# Short name, same program.
+[[bin]]
+name = "po"
+path = "src/bin/po.rs"
+
 [dependencies]
 eyre = "0.6.14"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }

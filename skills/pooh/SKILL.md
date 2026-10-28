@@ -7,7 +7,7 @@ description: Find, register and jump between the user's projects and git worktre
 
 `pooh` is the user's project manager. It knows every registered project, its git worktrees, and (via zoxide) which directories the user visits most. Every command takes `--json`; always pass it and parse the result instead of scraping text.
 
-`pooh pick` is an interactive TUI. Never run it from an agent: use `resolve` or `list`.
+`pooh pick` (also `po pick`) is an interactive TUI. Never run it from an agent: use `resolve` or `list`.
 
 ## Find a project
 
