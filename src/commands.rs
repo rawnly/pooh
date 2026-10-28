@@ -10,7 +10,7 @@ use crate::entries::{self, Entry, Filter};
 use crate::store::{Project, Store, default_name};
 use crate::{
     AddArgs, Args, Command, ImportArgs, InitArgs, ListArgs, PickArgs, PruneArgs, RemoveArgs,
-    ResolveArgs, SkillAction, SkillArgs, TagArgs, WorktreeAction, WorktreeArgs, git, picker, skill,
+    ResolveArgs, SkillAction, SkillArgs, TagArgs, WorktreeAction, WorktreeArgs, git, skill, tui,
     zoxide,
 };
 
@@ -108,12 +108,10 @@ fn project_for(path: &Path, name: Option<String>, tags: Vec<String>) -> Result<P
 
 fn add(json: bool, a: AddArgs) -> Result<u8> {
     let tags = split_tags(&a.tag);
-    let mut store = Store::load()?;
 
     if !a.scan {
         let project = project_for(&a.path, a.name, tags)?;
-        store.add(project.clone())?;
-        store.save()?;
+        Store::modify(|store| store.add(project.clone()))?;
         if json {
             print_json(&project_json(&project, None))?;
         } else {
@@ -127,22 +125,24 @@ fn add(json: bool, a: AddArgs) -> Result<u8> {
     }
     let mut dirs: Vec<PathBuf> = fs::read_dir(&a.path)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir() && git::inspect(p).is_some())
+        .filter(|p| p.is_dir() && git::is_repo_root(p))
         .collect();
     dirs.sort();
 
-    let (mut added, mut skipped) = (Vec::new(), Vec::new());
-    for dir in dirs {
-        let result = project_for(&dir, None, tags.clone()).and_then(|p| {
-            store.add(p.clone())?;
-            Ok(p)
-        });
-        match result {
-            Ok(p) => added.push(p),
-            Err(e) => skipped.push(json!({ "path": dir, "reason": e.to_string() })),
+    let (added, skipped) = Store::modify(|store| {
+        let (mut added, mut skipped) = (Vec::new(), Vec::new());
+        for dir in dirs {
+            let result = project_for(&dir, None, tags.clone()).and_then(|p| {
+                store.add(p.clone())?;
+                Ok(p)
+            });
+            match result {
+                Ok(p) => added.push(p),
+                Err(e) => skipped.push(json!({ "path": dir, "reason": e.to_string() })),
+            }
         }
-    }
-    store.save()?;
+        Ok((added, skipped))
+    })?;
     if json {
         let added: Vec<Value> = added.iter().map(|p| project_json(p, None)).collect();
         print_json(&json!({ "added": added, "skipped": skipped }))?;
@@ -206,9 +206,7 @@ fn worktree_line(wt: &git::Worktree) -> String {
 }
 
 fn remove(json: bool, a: RemoveArgs) -> Result<u8> {
-    let mut store = Store::load()?;
-    let project = store.remove(&a.name)?;
-    store.save()?;
+    let project = Store::modify(|store| store.remove(&a.name))?;
     if json {
         print_json(&json!({ "removed": [project] }))?;
     } else {
@@ -218,20 +216,20 @@ fn remove(json: bool, a: RemoveArgs) -> Result<u8> {
 }
 
 fn tag(json: bool, a: TagArgs) -> Result<u8> {
-    let mut store = Store::load()?;
     let tags = split_tags(&a.tags);
-    let project = store
-        .find_mut(&a.project)
-        .ok_or_else(|| eyre!("project '{}' not found", a.project))?;
-    for t in tags {
-        if a.remove {
-            project.tags.retain(|x| *x != t);
-        } else if !project.tags.contains(&t) {
-            project.tags.push(t);
+    let project = Store::modify(|store| {
+        let project = store
+            .find_mut(&a.project)
+            .ok_or_else(|| eyre!("project '{}' not found", a.project))?;
+        for t in tags {
+            if a.remove {
+                project.tags.retain(|x| *x != t);
+            } else if !project.tags.contains(&t) {
+                project.tags.push(t);
+            }
         }
-    }
-    let project = project.clone();
-    store.save()?;
+        Ok(project.clone())
+    })?;
     if json {
         print_json(&project_json(&project, None))?;
     } else {
@@ -250,9 +248,12 @@ fn filter(tag: &[String], project: Option<String>, no_worktrees: bool) -> Filter
 }
 
 /// Records the jump in the project store and in zoxide.
-fn visit(store: &mut Store, entry: &Entry) -> Result<()> {
-    store.touch(&entry.project);
-    store.save()?;
+fn visit(entry: &Entry) -> Result<()> {
+    // Reloaded under the lock: the picker may have been open for a while.
+    Store::modify(|store| {
+        store.touch(&entry.project);
+        Ok(())
+    })?;
     zoxide::add(&entry.path);
     Ok(())
 }
@@ -266,22 +267,54 @@ fn print_entry(json: bool, entry: &Entry) -> Result<()> {
     }
 }
 
+fn require_project(store: &Store, name: Option<&str>) -> Result<()> {
+    name.map_or(Ok(()), |n| store.get(n).map(|_| ()))
+}
+
 fn pick(json: bool, a: PickArgs) -> Result<u8> {
-    let mut store = Store::load()?;
+    let store = Store::load()?;
+    require_project(&store, a.project.as_deref())?;
     let entries = entries::build(&store, &filter(&a.tag, a.project, a.no_worktrees));
     if entries.is_empty() {
         bail!("no projects to pick from (add one with `pooh add`)");
     }
-    let Some(entry) = picker::pick(entries, a.query.as_deref())? else {
-        return Ok(1);
+    let Some(tty) = tui::open_tty() else {
+        bail!("pick needs a controlling terminal; use `resolve` or `list --json` instead");
     };
-    visit(&mut store, &entry)?;
+    // Tag edits are written as they happen, reloaded under the lock.
+    let mut save_tags = |project: &str, tags: &[String]| {
+        Store::modify(|store| {
+            if let Some(p) = store.find_mut(project) {
+                p.tags = tags.to_vec();
+            }
+            Ok(())
+        })
+    };
+    let options = tui::Options {
+        full_screen: a.full_screen,
+        vim: a.vim,
+    };
+    let query = a.query.as_deref().unwrap_or("");
+    let entry = match tui::run(tty, entries, query, &mut save_tags, options)? {
+        tui::Outcome::Picked(entry) => *entry,
+        tui::Outcome::Cancelled => {
+            if json {
+                print_json(&json!({ "cancelled": true }))?;
+            }
+            return Ok(1);
+        }
+        tui::Outcome::Unsupported => {
+            bail!("the terminal did not report its cursor position; try `pick --full-screen`")
+        }
+    };
+    visit(&entry)?;
     print_entry(json, &entry)?;
     Ok(0)
 }
 
 fn resolve(json: bool, a: ResolveArgs) -> Result<u8> {
-    let mut store = Store::load()?;
+    let store = Store::load()?;
+    require_project(&store, a.project.as_deref())?;
     let entries = entries::build(&store, &filter(&a.tag, a.project, a.no_worktrees));
     let Some(entry) = entries::best_match(&entries, &a.query).cloned() else {
         if json {
@@ -291,7 +324,7 @@ fn resolve(json: bool, a: ResolveArgs) -> Result<u8> {
         }
         return Ok(1);
     };
-    visit(&mut store, &entry)?;
+    visit(&entry)?;
     print_entry(json, &entry)?;
     Ok(0)
 }
@@ -311,6 +344,54 @@ fn project_arg<'a>(store: &'a Store, name: Option<&str>) -> Result<&'a Project> 
     }
 }
 
+/// Pick the worktree a user means by `target`: exact branch, then path, then folder
+/// name. Ambiguity at the winning level is an error rather than a guess.
+fn find_worktree<'a>(wts: &'a [git::Worktree], target: &str) -> Result<&'a git::Worktree> {
+    let path = fs::canonicalize(target).ok();
+    let linked = || wts.iter().filter(|wt| !wt.main);
+    let levels: [Vec<&git::Worktree>; 3] = [
+        linked()
+            .filter(|wt| wt.branch.as_deref() == Some(target))
+            .collect(),
+        linked()
+            .filter(|wt| {
+                path.as_deref()
+                    .is_some_and(|p| fs::canonicalize(&wt.path).is_ok_and(|w| w == p))
+            })
+            .collect(),
+        linked().filter(|wt| wt.name == target).collect(),
+    ];
+    for hits in levels {
+        match hits.as_slice() {
+            [] => {}
+            [one] => return Ok(one),
+            many => bail!(
+                "'{target}' matches several worktrees: {}; use the path",
+                many.iter()
+                    .map(|w| w.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    bail!("no linked worktree matches '{target}'")
+}
+
+/// `base`, `base-2`, `base-3`, ... until it does not exist.
+fn unused_path(base: PathBuf) -> PathBuf {
+    if !base.exists() {
+        return base;
+    }
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (2..)
+        .map(|n| base.with_file_name(format!("{name}-{n}")))
+        .find(|p| !p.exists())
+        .expect("unbounded range")
+}
+
 fn worktree(json: bool, a: WorktreeArgs) -> Result<u8> {
     let store = Store::load()?;
     match a.action {
@@ -327,33 +408,28 @@ fn worktree(json: bool, a: WorktreeArgs) -> Result<u8> {
         }
         WorktreeAction::Add(w) => {
             let project = project_arg(&store, w.project.as_deref())?;
-            let path = w
-                .path
-                .map(|p| std::path::absolute(&p))
-                .transpose()?
-                .unwrap_or_else(|| {
-                    git::default_worktree_path(&project.path, project.bare, &w.branch)
-                });
-            git::add_worktree(&project.path, &w.branch, &path, w.base.as_deref())?;
+            let path = match w.path {
+                Some(p) => std::path::absolute(&p)?,
+                None => unused_path(git::default_worktree_path(
+                    &project.path,
+                    project.bare,
+                    &w.branch,
+                )),
+            };
+            let branch = git::add_worktree(&project.path, &w.branch, &path, w.base.as_deref())?;
+            // Report the resolved path so it can be fed back to `worktree remove`.
+            let path = fs::canonicalize(&path).unwrap_or(path);
             zoxide::add(&path);
             if json {
-                print_json(&json!({ "project": project.name, "branch": w.branch, "path": path }))?;
+                print_json(&json!({ "project": project.name, "branch": branch, "path": path }))?;
             } else {
                 println!("{}", path.display());
             }
         }
         WorktreeAction::Remove(w) => {
             let project = project_arg(&store, w.project.as_deref())?;
-            let target = Path::new(&w.target);
-            let wt = git::list_worktrees(&project.path)?
-                .into_iter()
-                .find(|wt| {
-                    !wt.main
-                        && (wt.branch.as_deref() == Some(&w.target)
-                            || wt.name == w.target
-                            || wt.path == target)
-                })
-                .ok_or_else(|| eyre!("no linked worktree matches '{}'", w.target))?;
+            let wts = git::list_worktrees(&project.path)?;
+            let wt = find_worktree(&wts, &w.target)?.clone();
             git::remove_worktree(&project.path, &wt.path, w.force)?;
             if json {
                 print_json(&json!({ "project": project.name, "removed": wt }))?;
@@ -407,35 +483,66 @@ fn skip_reason(
     match git::inspect(path) {
         // Linked worktrees belong to a repository we already list (or will).
         Some(info) if info.linked => Some(Skip::LinkedWorktree),
-        Some(info) if !info.bare && info.root() != path => Some(Skip::Subdirectory),
+        Some(info) if !info.bare && git::toplevel(path).is_none_or(|top| top != path) => {
+            Some(Skip::Subdirectory)
+        }
         Some(_) => None,
         None => (!a.all).then_some(Skip::NotGit),
     }
 }
 
+/// `name`, else `<parent>-name`, else `name-2`, `name-3`, ...
+fn unique_name(store: &Store, name: &str, path: &Path) -> String {
+    if store.find(name).is_none() {
+        return name.to_owned();
+    }
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned());
+    let candidates = parent.map(|p| format!("{p}-{name}")).into_iter();
+    let numbered = (2..).map(|n| format!("{name}-{n}"));
+    candidates
+        .chain(numbered)
+        .find(|c| store.find(c).is_none())
+        .expect("unbounded range")
+}
+
 fn import(json: bool, a: ImportArgs) -> Result<u8> {
     // `source` is restricted to "zoxide" by the spec.
-    let mut store = Store::load()?;
-    let known: std::collections::HashSet<PathBuf> =
-        store.projects.iter().map(|p| p.path.clone()).collect();
-    let mut added = Vec::new();
-    let mut skipped: std::collections::BTreeMap<Skip, usize> = Default::default();
-    for (score, path) in zoxide::list() {
-        if let Some(reason) = skip_reason(&path, score, &known, &a) {
-            *skipped.entry(reason).or_default() += 1;
-            continue;
-        }
-        let project = project_for(&path, None, vec!["zoxide".into()])?;
-        if store.add(project.clone()).is_ok() {
-            added.push(project);
-        } else {
-            // Two zoxide paths can normalize to the same project name.
-            *skipped.entry(Skip::Registered).or_default() += 1;
-        }
-    }
-    if !a.dry_run {
-        store.save()?;
-    }
+    let entries = zoxide::list();
+    let run =
+        |store: &mut Store| -> Result<(Vec<Project>, std::collections::BTreeMap<Skip, usize>)> {
+            let known: std::collections::HashSet<PathBuf> =
+                store.projects.iter().map(|p| p.path.clone()).collect();
+            let mut added = Vec::new();
+            let mut skipped: std::collections::BTreeMap<Skip, usize> = Default::default();
+            for (score, path) in &entries {
+                // zoxide keeps logical paths (symlinks, /tmp); projects use real ones.
+                let Ok(path) = fs::canonicalize(path) else {
+                    *skipped.entry(Skip::Missing).or_default() += 1;
+                    continue;
+                };
+                if let Some(reason) = skip_reason(&path, *score, &known, &a) {
+                    *skipped.entry(reason).or_default() += 1;
+                    continue;
+                }
+                let mut project = project_for(&path, None, vec!["zoxide".into()])?;
+                project.name = unique_name(store, &project.name, &project.path);
+                if store.add(project.clone()).is_ok() {
+                    added.push(project);
+                } else {
+                    // Normalizes to a project we already have (e.g. a second path to one repo).
+                    *skipped.entry(Skip::Registered).or_default() += 1;
+                }
+            }
+            Ok((added, skipped))
+        };
+    let (added, skipped) = if a.dry_run {
+        run(&mut Store::load()?)?
+    } else {
+        Store::modify(run)?
+    };
     let total: usize = skipped.values().sum();
     if json {
         let items: Vec<Value> = added.iter().map(|p| project_json(p, None)).collect();
@@ -463,16 +570,20 @@ fn import(json: bool, a: ImportArgs) -> Result<u8> {
 }
 
 fn prune(json: bool, a: PruneArgs) -> Result<u8> {
-    let mut store = Store::load()?;
-    let (gone, kept): (Vec<_>, Vec<_>) = store.projects.drain(..).partition(|p| !p.exists());
-    store.projects = if a.dry_run {
-        gone.iter().cloned().chain(kept).collect()
-    } else {
-        kept
+    let find_gone = |store: &mut Store| {
+        let (gone, kept): (Vec<_>, Vec<_>) = store.projects.drain(..).partition(|p| !p.exists());
+        store.projects = if a.dry_run {
+            gone.iter().cloned().chain(kept).collect()
+        } else {
+            kept
+        };
+        Ok(gone)
     };
-    if !a.dry_run {
-        store.save()?;
-    }
+    let gone = if a.dry_run {
+        find_gone(&mut Store::load()?)?
+    } else {
+        Store::modify(find_gone)?
+    };
     if json {
         print_json(&json!({ "dry_run": a.dry_run, "removed": gone }))?;
     } else {

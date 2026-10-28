@@ -15,8 +15,10 @@ name = "po"
 path = "src/bin/po.rs"
 
 [dependencies]
+crossterm = "0.29.0"
 eyre = "0.6.14"
-inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+ratatui = "0.30.2"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 usage = { package = "usage-rs", version = "6", features = ["completions"] }

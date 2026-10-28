@@ -76,16 +76,60 @@ impl Project {
     }
 }
 
-/// Folder name, minus `.git` and with `.bare` replaced by its parent.
+/// Folder name, minus `.git`; `.bare` and `.git` folders are named after their parent.
 pub fn default_name(path: &Path) -> String {
     let leaf = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
     let name = match leaf(path) {
-        Some(n) if n == ".bare" => path.parent().and_then(leaf),
+        Some(n) if n == ".bare" || n == ".git" => path.parent().and_then(leaf),
         other => other,
     };
     let name = name.unwrap_or_else(|| "unknown".into());
-    name.strip_suffix(".git")
-        .map_or(name.clone(), str::to_owned)
+    match name.strip_suffix(".git") {
+        Some(stem) if !stem.is_empty() => stem.to_owned(),
+        _ => name,
+    }
+}
+
+/// Names end up in labels (`project:branch`), Rex session names and shell
+/// output, so keep them unambiguous and printable.
+pub fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("project name cannot be empty");
+    }
+    if name != name.trim() {
+        bail!("project name '{name}' has leading or trailing whitespace");
+    }
+    if name.contains(':') || name.chars().any(char::is_control) {
+        bail!("project name '{name}' cannot contain ':' or control characters");
+    }
+    Ok(())
+}
+
+/// Advisory `flock`, released when dropped.
+struct FileLock(fs::File);
+
+impl FileLock {
+    fn exclusive(path: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: as above; closing the file would release it too.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[derive(Debug)]
@@ -109,18 +153,41 @@ impl Store {
         Ok(Self { path, projects })
     }
 
-    /// Write atomically so a crash or a concurrent reader never sees a partial file.
+    /// Write atomically so a crash or a concurrent reader never sees a partial
+    /// file. A symlinked `projects.json` (dotfiles) is written through.
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
+        let target = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        if let Some(dir) = target.parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
         fs::write(&tmp, serde_json::to_string_pretty(&self.projects)?)?;
-        fs::rename(tmp, &self.path)?;
+        fs::rename(&tmp, &target).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
         Ok(())
     }
 
+    /// Load, change and save under an exclusive lock, so concurrent `pooh`
+    /// runs (and a picker that has been open for a while) never overwrite
+    /// each other's changes.
+    pub fn modify<R>(f: impl FnOnce(&mut Store) -> Result<R>) -> Result<R> {
+        Self::modify_at(config_dir().join("projects.json"), f)
+    }
+
+    pub fn modify_at<R>(path: PathBuf, f: impl FnOnce(&mut Store) -> Result<R>) -> Result<R> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let _lock = FileLock::exclusive(&path.with_extension("json.lock"))?;
+        let mut store = Self::load_from(path)?;
+        let out = f(&mut store)?;
+        store.save()?;
+        Ok(out)
+    }
+
     pub fn add(&mut self, project: Project) -> Result<()> {
+        validate_name(&project.name)?;
         if self.find(&project.name).is_some() {
             bail!("a project named '{}' already exists", project.name);
         }
@@ -158,18 +225,20 @@ impl Store {
         }
     }
 
-    /// The registered project that contains `dir` (the deepest match wins).
-    /// Linked worktrees of a project count as inside it.
+    /// The registered project that owns `dir`: the repository it belongs to
+    /// (linked worktrees included) if that is registered, else the deepest
+    /// registered ancestor directory.
     pub fn find_containing(&self, dir: &Path) -> Option<&Project> {
-        let direct = self
-            .projects
+        let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if let Some(root) = crate::git::inspect(&dir).map(|i| i.root())
+            && let Some(p) = self.projects.iter().find(|p| p.path == root)
+        {
+            return Some(p);
+        }
+        self.projects
             .iter()
             .filter(|p| dir.starts_with(&p.path))
-            .max_by_key(|p| p.path.components().count());
-        direct.or_else(|| {
-            let root = crate::git::inspect(dir)?.root();
-            self.projects.iter().find(|p| p.path == root)
-        })
+            .max_by_key(|p| p.path.components().count())
     }
 }
 
@@ -220,7 +289,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unusable_names() {
+        let (_d, mut s) = store();
+        for bad in ["", " a", "a ", "a:b", "a\tb"] {
+            assert!(s.add(project(bad, "/x")).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn concurrent_modifications_do_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    Store::modify_at(path, |s| {
+                        s.add(project(&format!("p{i}"), &format!("/p{i}")))
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(Store::load_from(path).unwrap().projects.len(), 16);
+    }
+
+    #[test]
+    fn save_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("projects.json");
+        std::fs::write(&real, "[]").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        Store::modify_at(link.clone(), |s| s.add(project("a", "/a"))).unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(real).unwrap().contains("\"a\""));
+    }
+
+    #[test]
     fn names_from_paths() {
+        assert_eq!(default_name(Path::new("/w/proj/.git")), "proj");
         assert_eq!(default_name(Path::new("/w/app")), "app");
         assert_eq!(default_name(Path::new("/w/app.git")), "app");
         assert_eq!(default_name(Path::new("/w/app/.bare")), "app");

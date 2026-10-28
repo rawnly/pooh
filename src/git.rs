@@ -22,6 +22,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 #[derive(Debug, Clone)]
 pub struct RepoInfo {
     pub common_dir: PathBuf,
+    /// Main checkout of a non-bare repository (differs from `common_dir`'s parent for
+    /// separate git dirs and submodules).
+    pub main_worktree: Option<PathBuf>,
     /// The repository itself is bare (worktrees live elsewhere).
     pub bare: bool,
     /// `path` is a linked worktree, not the main checkout.
@@ -31,6 +34,9 @@ pub struct RepoInfo {
 impl RepoInfo {
     /// Directory that should identify the repository in the project list.
     pub fn root(&self) -> PathBuf {
+        if let Some(main) = self.main_worktree.as_ref().filter(|_| !self.bare) {
+            return main.clone();
+        }
         if !self.bare && self.common_dir.file_name().is_some_and(|n| n == ".git") {
             return self.common_dir.parent().unwrap_or(&self.common_dir).into();
         }
@@ -59,8 +65,19 @@ pub fn inspect(path: &Path) -> Option<RepoInfo> {
         .args(["config", "--bool", "core.bare"])
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+    let linked = git_dir != common_dir;
+    let main_worktree = (linked && !bare)
+        .then(|| {
+            list_worktrees(path)
+                .ok()?
+                .into_iter()
+                .next()
+                .map(|w| w.path)
+        })
+        .flatten();
     Some(RepoInfo {
-        linked: git_dir != common_dir,
+        linked,
+        main_worktree,
         common_dir,
         bare,
     })
@@ -144,32 +161,72 @@ pub fn default_worktree_path(repo: &Path, bare: bool, branch: &str) -> PathBuf {
     let parent = repo.parent().unwrap_or(repo);
     let slug = slug(branch);
     match (bare, name.as_str()) {
-        (true, ".bare") => parent.join(slug),
+        (true, ".bare" | ".git") => parent.join(slug),
         (true, _) => parent.join(format!("{}-{slug}", name.trim_end_matches(".git"))),
         (false, _) => parent.join(format!("{name}-{slug}")),
     }
 }
 
-pub fn add_worktree(repo: &Path, branch: &str, path: &Path, base: Option<&str>) -> Result<()> {
-    let exists = git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .is_ok();
+fn ref_exists(repo: &Path, full_ref: &str) -> bool {
+    git(repo, &["rev-parse", "--verify", "--quiet", full_ref]).is_ok()
+}
+
+/// Creates the worktree and returns the branch it ended up on.
+///
+/// Existing local branch: checked out as is (`base` is rejected, it would be ignored).
+/// A remote branch (`feat` with a single `origin/feat`, or `origin/feat`): a local branch
+/// tracking it. Otherwise a new branch from `base` (default HEAD).
+pub fn add_worktree(repo: &Path, branch: &str, path: &Path, base: Option<&str>) -> Result<String> {
     let path = path.to_string_lossy();
-    if exists {
+    if ref_exists(repo, &format!("refs/heads/{branch}")) {
+        if base.is_some() {
+            bail!("branch '{branch}' already exists; --base only applies to new branches");
+        }
         git(repo, &["worktree", "add", &path, branch])?;
-    } else {
-        let mut args = vec!["worktree", "add", "-b", branch, &path];
-        args.extend(base);
-        git(repo, &args)?;
+        return Ok(branch.to_owned());
     }
-    Ok(())
+    if base.is_none() {
+        if ref_exists(repo, &format!("refs/remotes/{branch}")) {
+            let local = branch.split_once('/').map_or(branch, |(_, b)| b);
+            git(
+                repo,
+                &["worktree", "add", "--track", "-b", local, &path, branch],
+            )?;
+            return Ok(local.to_owned());
+        }
+        let refs = git(
+            repo,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+        )?;
+        let suffix = format!("/{branch}");
+        if refs.lines().any(|r| {
+            r.strip_prefix("refs/remotes/")
+                .is_some_and(|r| r.ends_with(&suffix) && !r.ends_with("/HEAD"))
+        }) {
+            // Let git pick the remote branch (it refuses when several remotes match).
+            git(repo, &["worktree", "add", &path, branch])?;
+            return Ok(branch.to_owned());
+        }
+    }
+    let mut args = vec!["worktree", "add", "-b", branch, &path];
+    args.extend(base);
+    git(repo, &args)?;
+    Ok(branch.to_owned())
+}
+
+/// Top-level directory of the work tree `path` is in (`None` for bare repos / non-repos).
+pub fn toplevel(path: &Path) -> Option<PathBuf> {
+    let out = git(path, &["rev-parse", "--show-toplevel"]).ok()?;
+    std::fs::canonicalize(out).ok()
+}
+
+/// Child directories that are the root of their own repository (not `.git`,
+/// not folders merely inside one, not linked worktrees).
+pub fn is_repo_root(dir: &Path) -> bool {
+    let Some(info) = inspect(dir) else {
+        return false;
+    };
+    !info.linked && (dir.join(".git").exists() || (info.bare && info.common_dir == dir))
 }
 
 pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
@@ -206,5 +263,6 @@ mod tests {
             Path::new("/w/app/feat-x")
         );
         assert_eq!(p("/w/app.git", true, "dev"), Path::new("/w/app-dev"));
+        assert_eq!(p("/w/app/.git", true, "dev"), Path::new("/w/app/dev"));
     }
 }

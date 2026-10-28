@@ -103,7 +103,12 @@ pub fn best_match<'a>(entries: &'a [Entry], query: &str) -> Option<&'a Entry> {
         .iter()
         .filter_map(|e| {
             let fuzzy = crate::fuzzy::score(query, &e.search_text())?;
-            let exact = if e.label == query { 10_000 } else { 0 };
+            let branch = e.worktree.as_ref().and_then(|w| w.branch.as_deref());
+            let exact = if e.label == query || branch == Some(query) {
+                10_000
+            } else {
+                0
+            };
             Some((e, fuzzy + exact))
         })
         // `max_by_key` keeps the last of equal keys; entries are rank-sorted, so keep the first.
@@ -134,6 +139,17 @@ mod tests {
     fn exact_label_beats_fuzzy() {
         let entries = [entry("api-gateway", 9.0), entry("api", 1.0)];
         assert_eq!(best_match(&entries, "api").unwrap().label, "api");
+    }
+
+    #[test]
+    fn exact_branch_beats_a_fuzzier_project_name() {
+        let mut wt = entry("app:feat", 1.0);
+        wt.worktree = Some(WorktreeRef {
+            name: "app-feat".into(),
+            branch: Some("feat".into()),
+        });
+        let entries = [entry("feature-flags", 9.0), wt];
+        assert_eq!(best_match(&entries, "feat").unwrap().label, "app:feat");
     }
 
     #[test]

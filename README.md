@@ -4,7 +4,7 @@ Installs two binaries: `pooh` and the short `po` (same program).
 
 Project manager for the terminal. Register projects once, then jump to them (or to their git worktrees) from your shell, tmux, herdr or rex. Built on [usage-rs](https://usage.jdx.dev): completions, man page and a machine-readable spec come from the binary itself.
 
-Every command accepts `--json`. On failure it prints `{"error": "..."}` and exits 2; exit 1 means cancelled or no match.
+Every data command accepts `--json` (`init`, `completions`, `spec` and `skill show` print plain text). On failure it prints `{"error": "..."}` on stdout and exits 2, usage errors included; exit 1 means cancelled or no match. Project names cannot be empty, contain `:` or control characters, or have leading/trailing whitespace.
 
 ## Usage
 
@@ -19,6 +19,38 @@ pooh remove <project>           # alias: rm
 pooh prune [-n]                 # drop projects whose directory is gone
 ```
 
+### Picker
+
+`pick` opens an inline picker (a few rows under the cursor, no alternate screen) drawn on the tty, so stdout carries only the result. `--full-screen` uses the alternate screen instead (what the Rex plugin does, since it runs in a float). The inline view needs the terminal to answer a cursor-position query; if it doesn't, `pick` fails with a hint to use `--full-screen`.
+
+| Key | Action |
+| --- | --- |
+| type | fuzzy filter (matches name, branch and tags) |
+| `↑` `↓` `ctrl-p` `ctrl-n` `PgUp` `PgDn` | move |
+| `tab` / `shift-tab` | cycle the tag filter |
+| `ctrl-o` | cycle all / projects only / worktrees only |
+| `ctrl-e` | edit the highlighted project's tags (comma-separated, `enter` saves) |
+| `enter` | pick |
+| `esc` `ctrl-c` | cancel (exit 1) |
+
+Text editing: `←` `→` `home` `end` `ctrl-w` `ctrl-u`.
+
+`--vim` (or `POOH_VIM=1`) makes the picker modal, like `bracco --vim`. It starts in normal mode and typing does not filter:
+
+| Key (normal mode) | Action |
+| --- | --- |
+| `j` `k` | move |
+| `g` `G` | top / bottom |
+| `d` `u` | down / up 10 |
+| `/` `i` `a` | search (`esc` goes back to normal mode) |
+| `t` `T` | next / previous tag filter |
+| `w` | cycle all / projects / worktrees |
+| `e` | edit tags |
+| `enter` | pick |
+| `q` `esc` | cancel |
+
+In the Rex plugin, pass it with `args = { "--vim" }`.
+
 ### Worktrees
 
 Worktrees are read live from git, so anything created with plain `git worktree` shows up too. `pick` and `resolve` treat each worktree as `project:branch`.
@@ -26,7 +58,7 @@ Worktrees are read live from git, so anything created with plain `git worktree` 
 ```sh
 pooh worktree list              # alias: wt; default project = the one containing cwd
 pooh worktree add feat/login    # -b BASE, --path DIR, -p PROJECT
-pooh worktree remove feat/login # branch, name or path; -f to force
+pooh worktree remove feat/login # branch, then path (relative ok), then folder name; -f to force
 ```
 
 Adding a linked worktree with `pooh add` registers its main repository. Bare repos (including the `repo/.bare` layout) are supported; their root is not a jump target while they have worktrees.
@@ -58,7 +90,7 @@ The skill source lives in [`skills/pooh/SKILL.md`](skills/pooh/SKILL.md).
 
 ## Integrations
 
-`pick --json` prints `{label, project, path, project_path, tags, worktree}`; the UI is on stderr, so it composes with `$(...)`.
+`pick --json` prints `{label, project, path, project_path, tags, worktree}`; the UI is drawn on the tty, so it composes with `$(...)`.
 
 **tmux** (`~/.tmux.conf`): open the pick in a new window.
 
@@ -81,7 +113,7 @@ amber.setup({
 })
 ```
 
-Then `rex do amber_install` and `rex config reload` twice, as for any Amber plugin. For a local checkout use `path = "/abs/path/to/pooh"` instead of the repo name.
+Then `rex do amber_install` and `rex config reload` twice, as for any Amber plugin. For a local checkout add `path = "/abs/path/to/pooh"` to the spec (the `owner/repo` string stays).
 
 Without Amber, clone the repo anywhere and load the module yourself:
 
@@ -96,8 +128,9 @@ Or skip the key and run `rex do pooh_pick`. Options (all optional):
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `bin` | `"pooh"` | pooh executable |
-| `mode` | `"session"` | `"session"`: switch to the pick's own session; `"window"`: new tab in the current session |
+| `mode` | `"session"` | `"session"`: switch to the pick's own session; `"window"`: tab in the current session. Both reuse the one a previous pick created (tabs are found through a `pooh:<name>` block label, so a tab you named by hand is not reused) |
 | `session_label` | `"label"` | name sessions/tabs by `project[:branch]`, or `"path"` to use the directory |
+| `full_screen` | `true` | run the picker with `--full-screen` so it fills the float |
 | `args` | `{}` | extra `pooh pick` flags, e.g. `{ "--tag", "work" }` |
 | `bounds` | `{0.2, 0.2, 0.6, 0.6}` | float geometry as window fractions |
 | `key` | none | key binding for the action |

@@ -38,10 +38,10 @@ pooh worktree list --json
 pooh worktree add feat/login --json           # new branch from HEAD
 pooh worktree add feat/login -b main --json   # new branch from main
 pooh worktree add existing-branch --json      # checks out the existing branch
-pooh worktree remove feat/login --json        # target: branch, name or path
+pooh worktree remove feat/login --json        # target: branch, path (relative ok) or folder name, in that order
 ```
 
-`add` returns `{"project","branch","path"}`. The default location is a sibling of the repository (`<repo>-<branch-with-dashes>`); bare repos in a `.bare` layout get `<parent>/<branch>`. Override with `--path`. Removing refuses dirty trees unless `--force`: ask the user before forcing.
+`add` returns `{"project","branch","path"}`. The default location is a sibling of the repository (`<repo>-<branch-with-dashes>`); bare repos in a `.bare` layout get `<parent>/<branch-with-dashes>`; a taken path gets a `-2`, `-3`... suffix. An existing branch is checked out as is, a remote-only branch becomes a local tracking branch, and `--base` only applies to new branches. Override with `--path`. Removing refuses dirty trees unless `--force`: ask the user before forcing.
 
 ## Manage the list
 
@@ -56,7 +56,7 @@ pooh import zoxide --dry-run --json              # bring in git repos zoxide alr
 
 ## Errors
 
-On failure `--json` prints `{"error":"..."}` on stdout and exits 2. Exit 1 means "no match". Do not retry blindly: read the message.
+On failure `--json` prints `{"error":"..."}` on stdout and exits 2 (usage errors included). Exit 1 means "no match" (or, for `pick`, cancelled). Do not retry blindly: read the message.
 
 ## Config
 
