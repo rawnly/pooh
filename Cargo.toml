@@ -15,7 +15,9 @@ name = "po"
 path = "src/bin/po.rs"
 
 [dependencies]
-crossterm = "0.29.0"
+# use-dev-tty: read input from /dev/tty even when stdin is not a terminal. Without it
+# crossterm busy-loops on macOS (kqueue cannot poll the tty device).
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 eyre = "0.6.14"
 ratatui = "0.30.2"
 libc = "0.2"

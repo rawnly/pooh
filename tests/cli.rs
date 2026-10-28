@@ -443,3 +443,35 @@ fn sibling_worktrees_resolve_to_their_repo_even_under_a_registered_parent() {
         "app"
     );
 }
+
+#[test]
+fn json_usage_errors_never_run_the_command() {
+    let e = Env::new();
+    let d = e.dir("d");
+    let (code, out) = e.pooh(&d, &["--json", "add", "--name", "--json", "foo"]);
+    assert_eq!(code, 2);
+    let msg = serde_json::from_str::<Value>(&out).unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!msg.contains("Flag {"), "{msg}");
+    assert_eq!(
+        e.json(&d, &["list", "--json"]),
+        serde_json::json!([]),
+        "add must not have run"
+    );
+}
+
+#[test]
+fn unwritable_store_does_not_swallow_the_answer() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    let app = e.dir("app");
+    e.json(&app, &["add", "--json"]);
+    let cfg = e.root.path().join("config");
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, out) = e.pooh(&app, &["resolve", "app", "--json"]);
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["label"], "app");
+}

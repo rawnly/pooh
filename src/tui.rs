@@ -4,6 +4,8 @@
 use std::cmp::Reverse;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -106,7 +108,11 @@ impl TextInput {
     fn delete_word(&mut self) {
         let before = &self.text[..self.cursor];
         let trimmed = before.trim_end();
-        let at = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let at = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
         self.text.replace_range(at..self.cursor, "");
         self.cursor = at;
     }
@@ -163,6 +169,8 @@ struct Picker {
     /// Modal keys: start in normal mode, `/` `i` `a` to search, esc to leave search.
     vim: bool,
     insert: bool,
+    /// One-line error shown in the status bar until the next key (e.g. a failed save).
+    notice: Option<String>,
 }
 
 impl Picker {
@@ -177,6 +185,7 @@ impl Picker {
             edit: None,
             vim,
             insert: !vim,
+            notice: None,
         };
         picker.refilter();
         picker
@@ -372,10 +381,11 @@ impl Picker {
     }
 }
 
-/// Tags may be separated by commas and/or whitespace.
+/// Tags are separated by commas only: the CLI allows spaces inside a tag, and
+/// reopening such a tag in the editor must not split it.
 fn parse_tags(text: &str) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
-    for t in text.split(|c: char| c == ',' || c.is_whitespace()) {
+    for t in text.split(',').map(str::trim) {
         if !t.is_empty() && !tags.iter().any(|x| x == t) {
             tags.push(t.to_owned());
         }
@@ -383,13 +393,38 @@ fn parse_tags(text: &str) -> Vec<String> {
     tags
 }
 
+/// Terminal columns `text` takes (CJK is double width).
+fn text_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+/// `text` cut to `max` columns, with an ellipsis when something was dropped; also
+/// returns the columns used.
+fn clip(text: &str, max: usize) -> (String, usize) {
+    if text_width(text) <= max {
+        return (text.to_owned(), text_width(text));
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        if text_width(&format!("{out}{c}")) + 1 > max {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    let used = text_width(&out);
+    (out, used)
+}
+
 fn tilde(path: &std::path::Path) -> String {
-    let shown = path.display().to_string();
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => shown
-            .strip_prefix(&home)
-            .map_or(shown.clone(), |rest| format!("~{rest}")),
-        _ => shown,
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        // Component-wise: /Users/fed must not match /Users/federico.
+        Some(home) => match path.strip_prefix(home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        None => path.display().to_string(),
     }
 }
 
@@ -460,7 +495,7 @@ fn draw_list(f: &mut Frame, picker: &Picker, area: Rect) {
     let label_width = picker
         .hits
         .iter()
-        .map(|h| picker.entries[h.index].label.chars().count())
+        .map(|h| text_width(&picker.entries[h.index].label))
         .max()
         .unwrap_or(0)
         .min(MAX_LABEL);
@@ -471,8 +506,8 @@ fn draw_list(f: &mut Frame, picker: &Picker, area: Rect) {
         .map(|hit| {
             let entry = &picker.entries[hit.index];
             let mut spans = Vec::new();
-            let label_len = entry.label.chars().count();
-            for (i, c) in entry.label.chars().enumerate() {
+            let (label, label_len) = clip(&entry.label, MAX_LABEL);
+            for (i, c) in label.chars().enumerate() {
                 let style = if hit.positions.binary_search(&i).is_ok() {
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
@@ -518,6 +553,13 @@ fn draw_list(f: &mut Frame, picker: &Picker, area: Rect) {
 
 fn draw_status(f: &mut Frame, picker: &Picker, area: Rect) {
     let dim = Style::new().fg(Color::DarkGray);
+    if let Some(notice) = &picker.notice {
+        f.render_widget(
+            Paragraph::new(Span::styled(notice.clone(), Style::new().fg(Color::Red))),
+            area,
+        );
+        return;
+    }
     let text = if picker.edit.is_some() {
         "enter save · esc cancel · separate tags with commas".to_owned()
     } else {
@@ -607,7 +649,46 @@ impl Drop for TermGuard {
     }
 }
 
+/// Set by SIGTERM/SIGHUP/SIGQUIT so the event loop can restore the terminal first.
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_terminate(_: libc::c_int) {
+    TERMINATED.store(true, Ordering::SeqCst);
+}
+
+const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+struct SignalGuard;
+
+impl SignalGuard {
+    fn install() -> Self {
+        TERMINATED.store(false, Ordering::SeqCst);
+        for sig in SIGNALS {
+            // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+            unsafe { libc::signal(sig, on_terminate as *const () as libc::sighandler_t) };
+        }
+        Self
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        for sig in SIGNALS {
+            // SAFETY: restoring the default disposition.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+    }
+}
+
+enum Wake {
+    Key(KeyEvent),
+    Redraw,
+    Terminated,
+}
+
 pub enum Outcome {
+    /// Killed by a signal; the terminal has been restored.
+    Interrupted,
     /// The terminal did not answer the cursor-position query an inline view needs.
     Unsupported,
     Cancelled,
@@ -632,6 +713,7 @@ pub fn run(
 ) -> Result<Outcome> {
     let full_screen = options.full_screen;
     let _redirect = StdoutRedirect::to(&tty)?;
+    let _signals = SignalGuard::install();
     enable_raw_mode()?;
     let _guard = TermGuard {
         tty: tty.try_clone()?,
@@ -665,19 +747,36 @@ pub fn run(
 
     let picked = loop {
         terminal.draw(|f| view(f, &picker))?;
-        let Event::Key(key) = event::read()? else {
-            continue;
+        // Wake up regularly so a SIGTERM/SIGHUP is noticed while idle.
+        let key = loop {
+            if TERMINATED.load(Ordering::SeqCst) {
+                break Wake::Terminated;
+            }
+            if !event::poll(Duration::from_millis(100))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => break Wake::Key(key),
+                Event::Resize(..) => break Wake::Redraw,
+                _ => {}
+            }
         };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
+        let key = match key {
+            Wake::Key(key) => key,
+            Wake::Redraw => continue,
+            Wake::Terminated => break Outcome::Interrupted,
+        };
+        picker.notice = None;
         match picker.handle_key(key) {
             Action::None => {}
             Action::Cancel => break Outcome::Cancelled,
             Action::Select(entry) => break Outcome::Picked(entry),
             Action::SaveTags { project, tags } => {
-                save_tags(&project, &tags)?;
-                picker.apply_tags(&project, tags);
+                // A failed write must not end the session or lose the pick.
+                match save_tags(&project, &tags) {
+                    Ok(()) => picker.apply_tags(&project, tags),
+                    Err(e) => picker.notice = Some(format!("could not save tags: {e}")),
+                }
             }
         }
     };
@@ -692,6 +791,8 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -812,7 +913,7 @@ mod tests {
         let mut p = picker();
         p.handle_key(ctrl('e'));
         assert_eq!(p.edit.as_ref().unwrap().1.text, "work");
-        type_text(&mut p, ", rust rust");
+        type_text(&mut p, ", rust, rust");
         let Action::SaveTags { project, tags } = p.handle_key(key(KeyCode::Enter)) else {
             panic!("expected SaveTags");
         };
@@ -858,7 +959,9 @@ mod tests {
 
     #[test]
     fn parses_tag_lists() {
-        assert_eq!(parse_tags("a, b  c,,a"), ["a", "b", "c"]);
+        assert_eq!(parse_tags("a, b  c,,a"), ["a", "b  c"]);
+        // Spaces inside a tag survive an open-and-save round trip.
+        assert_eq!(parse_tags(&["my tag".to_owned()].join(", ")), ["my tag"]);
         assert!(parse_tags("  ").is_empty());
     }
 
@@ -974,5 +1077,41 @@ mod tests {
         type_text(&mut p, "j");
         assert_eq!(p.input.text, "j");
         assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::Cancel));
+    }
+
+    #[test]
+    fn delete_word_handles_multibyte_whitespace() {
+        let mut t = TextInput::new("foo\u{a0}bar");
+        t.delete_word();
+        assert_eq!(t.text, "foo\u{a0}");
+        let mut t = TextInput::new("x\u{3000}y");
+        t.delete_word();
+        assert_eq!(t.text, "x\u{3000}");
+    }
+
+    #[test]
+    fn tilde_matches_whole_components() {
+        // SAFETY: tests in this binary do not read HOME concurrently with this one.
+        unsafe { std::env::set_var("HOME", "/Users/fed") };
+        assert_eq!(tilde(Path::new("/Users/fed/x")), "~/x");
+        assert_eq!(tilde(Path::new("/Users/fed")), "~");
+        assert_eq!(tilde(Path::new("/Users/federico/x")), "/Users/federico/x");
+    }
+
+    #[test]
+    fn clip_counts_display_width() {
+        assert_eq!(clip("abc", 5), ("abc".to_owned(), 3));
+        assert_eq!(clip("日本語", 6), ("日本語".to_owned(), 6));
+        let (clipped, used) = clip("日本語日本語", 7);
+        assert!(used <= 7, "{clipped} {used}");
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn failed_tag_saves_show_a_notice_and_keep_going() {
+        let mut p = picker();
+        p.notice = Some("could not save tags: nope".into());
+        let lines = render(&p, 70, 6);
+        assert!(lines[5].starts_with("could not save tags"), "{lines:?}");
     }
 }

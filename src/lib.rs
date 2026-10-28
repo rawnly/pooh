@@ -15,7 +15,7 @@ use usage::Cli;
 /// Project manager with git worktree and zoxide support.
 ///
 /// Register projects once, then jump to them (or to their worktrees) from a
-/// shell, tmux, herdr or rex. Every command accepts --json for scripts and agents.
+/// shell, tmux, herdr or rex. Every data command accepts --json for scripts and agents.
 /// Exit code: 0 ok, 1 cancelled / no match, 2 error.
 #[derive(Debug, Cli)]
 #[usage(bin = "pooh", version = env!("CARGO_PKG_VERSION"), unknown_flags = "error", completion, arg_required_else_help)]
@@ -293,28 +293,23 @@ pub struct CompletionsArgs {
 pub struct SpecArgs {}
 
 /// Entry point shared by the `pooh` and `po` binaries.
-/// usage-rs renders its errors only inside `parse`, so ask a child run for the
-/// first line it prints (without `--json`, which would just loop back here).
-fn usage_error_message(argv: &[std::ffi::OsString], fallback: &str) -> String {
-    let child = std::env::current_exe().ok().and_then(|exe| {
-        std::process::Command::new(exe)
-            .args(argv.iter().filter(|a| *a != "--json"))
-            .output()
-            .ok()
-    });
-    child
-        .map(|out| {
-            // The message is the first paragraph, before the usage block.
-            String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .skip_while(|l| l.trim().is_empty())
-                .take_while(|l| !l.trim().is_empty())
-                .map(|l| l.trim().trim_start_matches("error: "))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| fallback.to_owned())
+/// The first paragraph of usage-rs's own rendering of a parse error (the message,
+/// without the usage block).
+fn usage_error_message(argv: &[&std::ffi::OsStr], error: &usage::Error<'_, '_>) -> String {
+    let text =
+        usage::diagnostic::render(Args::spec(), argv, error, usage::diagnostic::Style::PLAIN);
+    let message = text
+        .lines()
+        .skip_while(|l| l.trim().is_empty())
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.trim().trim_start_matches("error: "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.is_empty() {
+        "invalid command line; see `pooh --help`".to_owned()
+    } else {
+        message
+    }
 }
 
 pub fn main() -> ExitCode {
@@ -335,7 +330,7 @@ pub fn main() -> ExitCode {
         if let Err(e) = Args::parse_from(&refs) {
             println!(
                 "{}",
-                serde_json::json!({ "error": usage_error_message(&argv, &format!("{e:?}")) })
+                serde_json::json!({ "error": usage_error_message(&refs, &e) })
             );
             return ExitCode::from(2);
         }

@@ -248,14 +248,18 @@ fn filter(tag: &[String], project: Option<String>, no_worktrees: bool) -> Filter
 }
 
 /// Records the jump in the project store and in zoxide.
-fn visit(entry: &Entry) -> Result<()> {
+///
+/// Best effort: a store that cannot be written must not swallow the answer.
+fn visit(entry: &Entry) {
     // Reloaded under the lock: the picker may have been open for a while.
-    Store::modify(|store| {
+    let saved = Store::modify(|store| {
         store.touch(&entry.project);
         Ok(())
-    })?;
+    });
+    if let Err(e) = saved {
+        eprintln!("pooh: could not record the visit: {e}");
+    }
     zoxide::add(&entry.path);
-    Ok(())
 }
 
 fn print_entry(json: bool, entry: &Entry) -> Result<()> {
@@ -275,8 +279,17 @@ fn pick(json: bool, a: PickArgs) -> Result<u8> {
     let store = Store::load()?;
     require_project(&store, a.project.as_deref())?;
     let entries = entries::build(&store, &filter(&a.tag, a.project, a.no_worktrees));
-    if entries.is_empty() {
+    if store.projects.is_empty() {
         bail!("no projects to pick from (add one with `pooh add`)");
+    }
+    if entries.is_empty() {
+        // The store has projects; the filters just excluded all of them.
+        if json {
+            print_json(&json!({ "error": "no projects match the filters" }))?;
+        } else {
+            eprintln!("pooh: no projects match the filters");
+        }
+        return Ok(1);
     }
     let Some(tty) = tui::open_tty() else {
         bail!("pick needs a controlling terminal; use `resolve` or `list --json` instead");
@@ -297,6 +310,7 @@ fn pick(json: bool, a: PickArgs) -> Result<u8> {
     let query = a.query.as_deref().unwrap_or("");
     let entry = match tui::run(tty, entries, query, &mut save_tags, options)? {
         tui::Outcome::Picked(entry) => *entry,
+        tui::Outcome::Interrupted => bail!("interrupted"),
         tui::Outcome::Cancelled => {
             if json {
                 print_json(&json!({ "cancelled": true }))?;
@@ -307,7 +321,7 @@ fn pick(json: bool, a: PickArgs) -> Result<u8> {
             bail!("the terminal did not report its cursor position; try `pick --full-screen`")
         }
     };
-    visit(&entry)?;
+    visit(&entry);
     print_entry(json, &entry)?;
     Ok(0)
 }
@@ -324,7 +338,7 @@ fn resolve(json: bool, a: ResolveArgs) -> Result<u8> {
         }
         return Ok(1);
     };
-    visit(&entry)?;
+    visit(&entry);
     print_entry(json, &entry)?;
     Ok(0)
 }
