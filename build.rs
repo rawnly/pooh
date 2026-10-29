@@ -106,4 +106,3 @@ fn main() {
         write(Path::new(&out), &formula);
     }
 }
-

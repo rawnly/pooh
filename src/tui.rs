@@ -207,10 +207,17 @@ impl Picker {
     }
 
     fn refilter(&mut self) {
-        let query = self.input.text.trim();
+        let (query, query_tags) = fuzzy::split_query(&self.input.text);
+        let query = query.as_str();
         let mut hits = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
-            let tag_ok = self.tag.as_ref().is_none_or(|t| entry.tags.contains(t));
+            let tag_ok = self.tag.as_ref().is_none_or(|t| entry.tags.contains(t))
+                && query_tags.iter().all(|q| {
+                    entry
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().starts_with(q.as_str()))
+                });
             if !tag_ok || !self.kind.shows(entry) {
                 continue;
             }
@@ -279,13 +286,41 @@ impl Picker {
 
     /// Normal-mode keys. `None` means "not mine": the shared bindings handle it.
     fn handle_normal(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.code == KeyCode::Esc && !self.input.text.is_empty() {
+            self.input = TextInput::default();
+            self.refilter();
+            return Some(Action::None);
+        }
         let KeyCode::Char(c) = key.code else {
             return None;
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return None;
+            let half = (MAX_ROWS / 2) as isize;
+            return match c {
+                'd' => {
+                    self.move_by(half);
+                    Some(Action::None)
+                }
+                'u' => {
+                    self.move_by(-half);
+                    Some(Action::None)
+                }
+                _ => None,
+            };
         }
         match c {
+            'h' => self.input.cursor = self.input.prev(),
+            'l' => self.input.cursor = self.input.next(),
+            '0' => self.input.cursor = 0,
+            '$' => self.input.cursor = self.input.text.len(),
+            'x' => {
+                self.input.delete();
+                self.refilter();
+            }
+            'D' => {
+                self.input.text.truncate(self.input.cursor);
+                self.refilter();
+            }
             'j' => self.move_by(1),
             'k' => self.move_by(-1),
             'g' => self.selected = 0,
@@ -472,10 +507,31 @@ fn draw_prompt(f: &mut Frame, picker: &Picker, area: Rect) {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(chips.width() as u16)])
             .areas(area);
 
-    let line = Line::from(vec![
-        Span::styled("› ", Style::new().fg(Color::Green)),
-        Span::raw(picker.input.text.clone()),
-    ]);
+    let mut spans = vec![Span::styled("› ", Style::new().fg(Color::Green))];
+    // Keep whitespace as-is while coloring recognized `#tag` tokens.
+    let known: Vec<String> = picker.tags().iter().map(|t| t.to_lowercase()).collect();
+    let mut rest = picker.input.text.as_str();
+    while !rest.is_empty() {
+        let ws = rest.starts_with(char::is_whitespace);
+        let end = rest
+            .find(|c: char| c.is_whitespace() != ws)
+            .unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        spans.push(
+            if !ws
+                && fuzzy::is_tag_token(word)
+                && known
+                    .iter()
+                    .any(|t| t.starts_with(&word[1..].to_lowercase()))
+            {
+                Span::styled(word.to_owned(), Style::new().fg(Color::Magenta))
+            } else {
+                Span::raw(word.to_owned())
+            },
+        );
+        rest = tail;
+    }
+    let line = Line::from(spans);
     let x = 2 + Line::from(&picker.input.text[..picker.input.cursor]).width();
     f.render_widget(Paragraph::new(line), text);
     f.render_widget(
@@ -492,13 +548,15 @@ fn draw_prompt(f: &mut Frame, picker: &Picker, area: Rect) {
 }
 
 fn draw_list(f: &mut Frame, picker: &Picker, area: Rect) {
+    // Give the label (project:branch) up to half the width so branches stay visible.
+    let max_label = (area.width as usize / 2).max(MAX_LABEL);
     let label_width = picker
         .hits
         .iter()
         .map(|h| text_width(&picker.entries[h.index].label))
         .max()
         .unwrap_or(0)
-        .min(MAX_LABEL);
+        .min(max_label);
 
     let items: Vec<ListItem> = picker
         .hits
@@ -506,7 +564,7 @@ fn draw_list(f: &mut Frame, picker: &Picker, area: Rect) {
         .map(|hit| {
             let entry = &picker.entries[hit.index];
             let mut spans = Vec::new();
-            let (label, label_len) = clip(&entry.label, MAX_LABEL);
+            let (label, label_len) = clip(&entry.label, max_label);
             for (i, c) in label.chars().enumerate() {
                 let style = if hit.positions.binary_search(&i).is_ok() {
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -864,6 +922,20 @@ mod tests {
     }
 
     #[test]
+    fn hash_tokens_filter_by_tag() {
+        let mut p = picker();
+        type_text(&mut p, "#me");
+        assert!(!p.hits.is_empty());
+        assert!(
+            p.hits
+                .iter()
+                .all(|h| p.entries[h.index].tags.contains(&"me".to_owned()))
+        );
+        type_text(&mut p, "zzz");
+        assert!(p.hits.is_empty());
+    }
+
+    #[test]
     fn tab_cycles_tags_through_no_filter() {
         let mut p = picker();
         p.handle_key(key(KeyCode::Tab));
@@ -1034,7 +1106,9 @@ mod tests {
         assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::None));
         assert!(!p.insert);
         assert_eq!(labels(&p), ["blog"]);
-        // In normal mode esc cancels and q quits.
+        // In normal mode esc clears the query first, then cancels; q quits.
+        assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::None));
+        assert_eq!(p.hits.len(), 4);
         assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::Cancel));
         assert!(matches!(
             p.handle_key(key(KeyCode::Char('q'))),
@@ -1060,6 +1134,31 @@ mod tests {
             Action::SaveTags { .. }
         ));
         assert!(!p.insert);
+    }
+
+    #[test]
+    fn vim_query_editing_and_esc_clears() {
+        let mut p = vim_picker();
+        p.handle_key(key(KeyCode::Char('i')));
+        type_text(&mut p, "sho");
+        p.handle_key(key(KeyCode::Esc));
+        assert!(!p.insert);
+        p.handle_key(key(KeyCode::Char('h')));
+        p.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(p.input.text, "sh");
+        p.handle_key(key(KeyCode::Char('0')));
+        p.handle_key(key(KeyCode::Char('D')));
+        assert_eq!(p.input.text, "");
+        type_text(&mut p, "");
+        p.handle_key(key(KeyCode::Char('i')));
+        type_text(&mut p, "sh");
+        p.handle_key(key(KeyCode::Esc));
+        // First esc leaves insert mode, second clears, third cancels.
+        assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::None));
+        assert_eq!(p.input.text, "");
+        assert!(matches!(p.handle_key(key(KeyCode::Esc)), Action::Cancel));
+        p.handle_key(ctrl('d'));
+        assert!(p.selected > 0 || p.hits.len() <= 1);
     }
 
     #[test]

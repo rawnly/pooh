@@ -28,7 +28,12 @@ pub struct Entry {
 
 impl Entry {
     pub fn search_text(&self) -> String {
-        format!("{} {}", self.label, self.tags.join(" "))
+        format!(
+            "{} {} {}",
+            self.label,
+            self.tags.join(" "),
+            self.path.display()
+        )
     }
 }
 

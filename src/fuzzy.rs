@@ -29,6 +29,25 @@ pub fn find(query: &str, text: &str) -> Option<Match> {
     })
 }
 
+/// True for a `#tag` query token (a bare `#` is not one yet).
+pub fn is_tag_token(token: &str) -> bool {
+    token.len() > 1 && token.starts_with('#')
+}
+
+/// Splits `#tag` tokens from the fuzzy part of a query: `(text, tags)`.
+pub fn split_query(query: &str) -> (String, Vec<String>) {
+    let mut text = Vec::new();
+    let mut tags = Vec::new();
+    for token in query.split_whitespace() {
+        if is_tag_token(token) {
+            tags.push(token[1..].to_lowercase());
+        } else {
+            text.push(token);
+        }
+    }
+    (text.join(" "), tags)
+}
+
 pub fn score(query: &str, text: &str) -> Option<i64> {
     find(query, text).map(|m| m.score)
 }
@@ -80,6 +99,13 @@ mod tests {
     #[test]
     fn empty_query_matches_everything() {
         assert!(score("", "anything").is_some());
+    }
+
+    #[test]
+    fn splits_tag_tokens() {
+        let (text, tags) = split_query("web #Work # api");
+        assert_eq!(text, "web # api");
+        assert_eq!(tags, ["work"]);
     }
 
     #[test]

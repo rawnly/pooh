@@ -41,13 +41,16 @@ Text editing: `←` `→` `home` `end` `ctrl-w` `ctrl-u`.
 | --- | --- |
 | `j` `k` | move |
 | `g` `G` | top / bottom |
-| `d` `u` | down / up 10 |
+| `d` `u` `ctrl-d` `ctrl-u` | down / up (10 / half page) |
+| `h` `l` `0` `$` | move the query cursor |
+| `x` `D` | delete char / delete to end of query |
 | `/` `i` `a` | search (`esc` goes back to normal mode) |
 | `t` `T` | next / previous tag filter |
 | `w` | cycle all / projects / worktrees |
 | `e` | edit tags |
 | `enter` | pick |
-| `q` `esc` | cancel |
+| `esc` | clear the query, or cancel when it is empty |
+| `q` | cancel |
 
 In the Rex plugin, pass it with `args = { "--vim" }`.
 
