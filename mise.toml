@@ -1,6 +1,7 @@
 [tools]
-mr-boxington = { version = "latest", workflow = "release.yml@refs/heads/main" }
-rust = "latest"
+mr-boxington = { version = "1.19.0", workflow = "release.yml@refs/heads/main" }
+rust = { version = "1.94.0", mr_boxington = true }
+lefthook = { version = "2.1.4", postinstall = "lefthook install" }
 
 [tasks.build]
 run = "cargo build --release"
@@ -10,3 +11,28 @@ run = "cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && c
 
 [tasks.install]
 run = "cargo install --path ."
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt --all"
+
+[tasks."lint:fmt"]
+description = "Check formatting (as CI does)"
+run = "cargo fmt --all --check"
+
+[tasks."lint:clippy"]
+description = "Run clippy with warnings denied (as CI does)"
+run = "cargo clippy --all-targets --locked -- -D warnings"
+
+[tasks.lint]
+description = "Formatting + clippy"
+depends = ["lint:fmt", "lint:clippy"]
+
+[tasks."update-deploy-key"]
+run = """
+ssh-keygen -t ed25519 -N "" -C "pooh release" -f /tmp/pooh-tap-key
+gh repo deploy-key add /tmp/pooh-tap-key.pub --repo rawnly/homebrew-tap --allow-write --title "pooh release"
+gh secret set HOMEBREW_TAP_DEPLOY_KEY --repo rawnly/pooh < /tmp/pooh-tap-key
+shred -u /tmp/pooh-tap-key 2>/dev/null || rm -P /tmp/pooh-tap-key
+"""
+tools = { gh = "latest" }

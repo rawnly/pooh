@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Project manager with git worktree and zoxide support, built for humans and agents"
 license = "MIT"
+repository = "https://github.com/rawnly/pooh"
 
 [[bin]]
 name = "pooh"

@@ -1,0 +1,261 @@
+name: release
+
+# Push a tag like `v0.1.0` (matching Cargo.toml's version) to cut a release:
+#   build (matrix) -> release (create GH release + upload archives)
+#   -> packslip (sign, read-only) -> publish-packslip (upload bundle)
+#   -> homebrew (render the formula with build.rs, push it to the tap)
+#   -> crates-io (cargo publish)
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: pooh
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          # mbx no longer ships an x86_64-apple-darwin binary, so the Intel
+          # build cross-compiles on the arm runner (Rosetta runs the result).
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Production release: keep mbx local-only. No remote cache and no
+      # GitHub cache restore/save, so cached objects cannot influence the
+      # published binaries.
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          backend: local
+
+      # `usage` renders the man page in scripts/generate.sh.
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+          mise_toml: |
+            [tools]
+            usage = "latest"
+
+      - name: Build
+        run: mbx build --release --locked --target ${{ matrix.target }}
+
+      - name: Generate completions and man page
+        run: scripts/generate.sh "target/${{ matrix.target }}/release/$BIN"
+
+      # Archive has no top-level directory, so packslip `archive:` paths are
+      # identical across all platforms.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage/bin" \
+            "$stage/share/man/man1" \
+            "$stage/share/usage" \
+            "$stage/share/skills/$BIN" \
+            "$stage/share/bash-completion/completions" \
+            "$stage/share/zsh/site-functions" \
+            "$stage/share/fish/vendor_completions.d"
+          install -m 755 "target/${{ matrix.target }}/release/$BIN" "$stage/bin/$BIN"
+          cp "dist/man/$BIN.1"            "$stage/share/man/man1/$BIN.1"
+          ln -s "$BIN.1" "$stage/share/man/man1/po.1"
+          cp "skills/$BIN/SKILL.md"       "$stage/share/skills/$BIN/SKILL.md"
+          cp "dist/$BIN.usage.kdl"        "$stage/share/usage/$BIN.kdl"
+          cp "dist/completions/$BIN.bash" "$stage/share/bash-completion/completions/$BIN"
+          cp "dist/completions/_$BIN"     "$stage/share/zsh/site-functions/_$BIN"
+          cp "dist/completions/$BIN.fish" "$stage/share/fish/vendor_completions.d/$BIN.fish"
+          mkdir -p out
+          tar -C "$stage" -cJf "out/$BIN-${{ matrix.target }}.tar.xz" bin share
+          tar -tJf "out/$BIN-${{ matrix.target }}.tar.xz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: archive-${{ matrix.target }}
+          path: out/*.tar.xz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: archive-*
+          path: out
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -l out
+          gh release create "$GITHUB_REF_NAME" out/*.tar.xz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
+
+  # Signs with the workflow's OIDC identity. Read-only on contents: it can
+  # download release assets but cannot modify the release.
+  packslip:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: jdx/packslip@v1
+        id: packslip
+        with:
+          download: pooh-*.tar.xz
+          bin: pooh=bin/pooh
+          resources: |
+            man=archive:share/man/man1/pooh.1
+            cli-spec/usage/pooh=archive:share/usage/pooh.kdl
+            skill/pooh=archive:share/skills/pooh
+            completion/bash/pooh=archive:share/bash-completion/completions/pooh
+            completion/zsh/pooh=archive:share/zsh/site-functions/_pooh
+            completion/fish/pooh=archive:share/fish/vendor_completions.d/pooh.fish
+          upload: false
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: packslip-bundle
+          path: ${{ steps.packslip.outputs.bundle }}
+          if-no-files-found: error
+
+  # The only job with release write access that touches the bundle; it
+  # uploads exactly the signed JSON file and nothing else.
+  publish-packslip:
+    needs: packslip
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: packslip-bundle
+          path: packslip
+      - name: Upload the signed bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f packslip/packslip.sigstore.json
+          gh release upload "$GITHUB_REF_NAME" packslip/packslip.sigstore.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Renders the Homebrew formula with build.rs (metadata from Cargo.toml,
+  # checksums from the published archives) and pushes it to the tap. Needs a
+  # `HOMEBREW_TAP_DEPLOY_KEY` secret (private half of an SSH deploy key with
+  # write access on the tap repo); without it the formula is only uploaded as
+  # a workflow artifact.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAP_REPO: rawnly/homebrew-tap
+      TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download archives and compute checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$BIN-*.tar.xz" --dir out
+          for f in out/$BIN-*.tar.xz; do
+            target=${f#out/$BIN-}; target=${target%.tar.xz}
+            var="POOH_SHA256_$(echo "$target" | tr 'a-z-' 'A-Z_')"
+            echo "$var=$(sha256sum "$f" | cut -d' ' -f1)" | tee -a "$GITHUB_ENV"
+          done
+
+      - name: Render formula (build.rs)
+        run: POOH_FORMULA_OUT="$PWD/Formula/$BIN.rb" cargo check --locked
+
+      - run: cat "Formula/$BIN.rb"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: homebrew-formula
+          path: Formula/${{ env.BIN }}.rb
+          if-no-files-found: error
+
+      - name: Push to the tap
+        if: env.TAP_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          ssh-add - <<<"$TAP_KEY"
+          git clone --depth 1 "git@github.com:${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp "Formula/$BIN.rb" "tap/Formula/$BIN.rb"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Formula/$BIN.rb"
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          git commit -m "$BIN $GITHUB_REF_NAME"
+          git push
+
+  # Publishes the crate. Needs a `CARGO_REGISTRY_TOKEN` repository secret
+  # (crates.io API token with the publish-new / publish-update scopes);
+  # without it the job is a no-op. Runs after `release` so a crate is never
+  # published for a tag whose binaries failed to build.
+  crates-io:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked
+      - name: Skipped
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo "::notice::CARGO_REGISTRY_TOKEN is not set, skipping crates.io publish"
