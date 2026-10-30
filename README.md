@@ -71,6 +71,7 @@ Adding a linked worktree with `pooh add` registers its main repository. Bare rep
 - `pooh import zoxide` registers the git repos zoxide already knows (`--all`, `--min-score N`, `-n`).
 - `pick` and `resolve` call `zoxide add`, so jumps feed zoxide.
 - Ranking combines pooh's own frecency with zoxide's score.
+- zoxide's database (`$_ZO_DATA_DIR/db.zo`) is read directly, with no subprocess; `zoxide query` is the fallback if it can't be read.
 - `POOH_ZOXIDE=0` turns all of it off.
 
 ### Shell
