@@ -7,6 +7,7 @@ name: release
 #   -> crates-io (cargo publish)
 
 on:
+  workflow_dispatch: 
   push:
     tags: ["**"]
 
