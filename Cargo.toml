@@ -1,10 +1,10 @@
 [package]
 name = "pooh"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "Project manager with git worktree and zoxide support, built for humans and agents"
-license = "MIT"
 repository = "https://github.com/rawnly/pooh"
+license = "MIT"
 
 [[bin]]
 name = "pooh"
@@ -20,8 +20,8 @@ path = "src/bin/po.rs"
 # crossterm busy-loops on macOS (kqueue cannot poll the tty device).
 crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 eyre = "0.6.14"
-ratatui = "0.30.2"
 libc = "0.2"
+ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 usage = { package = "usage-rs", version = "6", features = ["completions"] }
