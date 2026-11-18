@@ -279,6 +279,14 @@ fn pick(json: bool, a: PickArgs) -> Result<u8> {
     let store = Store::load()?;
     require_project(&store, a.project.as_deref())?;
     let entries = entries::build(&store, &filter(&a.tag, a.project, a.no_worktrees));
+    if a.list {
+        if json {
+            print_json(&entries)?;
+        } else {
+            entries.iter().for_each(|e| println!("{}", e.label));
+        }
+        return Ok(0);
+    }
     if store.projects.is_empty() {
         bail!("no projects to pick from (add one with `pooh add`)");
     }

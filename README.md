@@ -94,7 +94,7 @@ The skill source lives in [`skills/pooh/SKILL.md`](skills/pooh/SKILL.md).
 
 ## Integrations
 
-`pick --json` prints `{label, project, path, project_path, tags, worktree}`; the UI is drawn on the tty, so it composes with `$(...)`.
+`pick --json` prints `{label, project, path, project_path, tags, worktree}`; the UI is drawn on the tty, so it composes with `$(...)`. To draw your own picker, `pick --list --json` prints the ranked candidates as an array of the same objects (no tty, no visit recorded), and `resolve --json -p PROJECT -- LABEL` records the jump for the chosen one.
 
 **tmux** (`~/.tmux.conf`): open the pick in a new window.
 
@@ -105,7 +105,7 @@ bind-key f display-popup -E -w 60% -h 60% \
 
 **herdr**: run `pooh pick` inside a popup pane and open the result at that `cwd`. See bracco's `plugin/bracco.sh` for the same pattern with a file picker.
 
-**Rex** ([`rex/lua/pooh`](rex/lua/pooh/init.lua)): registers a `pooh_pick` action that opens the picker in a floating pane, then switches to a Rex session for the pick (created on first use, named `project` or `project:branch`).
+**Rex** ([`rex/lua/pooh`](rex/lua/pooh/init.lua)): registers a `pooh_pick` action that opens the picker in a floating pane (or Rex's command palette with `picker = "palette"`), then switches to a Rex session for the pick (created on first use, named `project` or `project:branch`).
 
 With [Amber](https://github.com/rawnly/amber), in `~/.config/rex/init.lua`:
 
@@ -134,8 +134,9 @@ Or skip the key and run `rex do pooh_pick`. Options (all optional):
 | `bin` | `"pooh"` | pooh executable |
 | `mode` | `"session"` | `"session"`: switch to the pick's own session; `"window"`: tab in the current session. Both reuse the one a previous pick created (tabs are found through a `pooh:<name>` block label, so a tab you named by hand is not reused) |
 | `session_label` | `"label"` | name sessions/tabs by `project[:branch]`, or `"path"` to use the directory |
+| `picker` | `"float"` | `"float"`: the `pooh pick` TUI in a floating pane; `"palette"`: a [Rex prompt](https://www.superlogical.com/rex/docs/customize/custom-ui) listing the same ranked entries (tags shown, no tag editing or vim keys; needs Rex API revision 17+ and the `--list` flag of this pooh) |
 | `full_screen` | `true` | run the picker with `--full-screen` so it fills the float |
-| `args` | `{}` | extra `pooh pick` flags, e.g. `{ "--tag", "work" }` |
+| `args` | `{}` | extra `pooh pick` flags, e.g. `{ "--tag", "work" }` (with the palette only the filters `--tag`, `--project`, `--no-worktrees` matter) |
 | `bounds` | `{0.2, 0.2, 0.6, 0.6}` | float geometry as window fractions |
 | `key` | none | key binding for the action |
 

@@ -137,6 +137,10 @@ pub struct PickArgs {
     /// Modal keys: start in normal mode (j/k, g/G, d/u, q), `/` or `i` to search
     #[usage(long, env = "POOH_VIM")]
     pub vim: bool,
+
+    /// Print the ranked candidates instead of picking (for other UIs; records no visit)
+    #[usage(long)]
+    pub list: bool,
 }
 
 #[derive(Debug, usage::Args)]

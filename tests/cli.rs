@@ -117,6 +117,26 @@ fn worktrees_resolve_and_remove() {
     assert_eq!(hit["worktree"]["branch"], "feat/x");
     assert_eq!(hit["project_path"], app.to_str().unwrap());
 
+    // `pick --list` needs no tty: the same entries the picker would show.
+    let listed = e.json(&app, &["pick", "--list", "--json"]);
+    let labels: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.contains(&"app") && labels.contains(&"app:feat/x"));
+    let (code, plain) = e.pooh(&app, &["pick", "--list", "--no-worktrees"]);
+    assert_eq!((code, plain.as_str()), (0, "app\n"));
+
+    // Exact labels resolve back to their entry, which is how other UIs record the visit.
+    let exact = e.json(
+        &app,
+        &["resolve", "--json", "-p", "app", "--", "app:feat/x"],
+    );
+    assert_eq!(exact["label"], "app:feat/x");
+
     let root = e.json(&app, &["resolve", "app", "--no-worktrees", "--json"]);
     assert!(root["worktree"].is_null());
 
